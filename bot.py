@@ -16,8 +16,10 @@ KEYWORDS = [
     "Spectacular Easy Tent",
     "Supreme Easy Tent",
     "DreamVille Easy Tent",
+    "Full Madness",
+    "Day Pass",
+    "Tomorrowland Ticket"
 ]
-
 SITES = [
     "https://www.stubhub.com/tomorrowland-tickets/grouping/150299040/",
     "https://www.viagogo.com/Festival-Tickets/International-Festivals/Tomorrowland-Tickets",
