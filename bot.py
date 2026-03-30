@@ -9,7 +9,6 @@ import requests
 from flask import Flask, request
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 RENDER_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip()
 
 app = Flask(__name__)
@@ -62,42 +61,66 @@ NEGATIVE_MARKERS = [
 ]
 
 SEEN_FILE = "seen_items.json"
+SUBSCRIBERS_FILE = "subscribers.json"
 
 
-def load_seen():
+def load_json_list(filename):
     try:
-        with open(SEEN_FILE, "r", encoding="utf-8") as f:
+        with open(filename, "r", encoding="utf-8") as f:
             data = json.load(f)
             if isinstance(data, list):
-                return set(data)
-            return set()
+                return data
+            return []
     except Exception:
-        return set()
+        return []
 
 
-def save_seen(items):
+def save_json_list(filename, items):
     try:
-        with open(SEEN_FILE, "w", encoding="utf-8") as f:
-            json.dump(sorted(list(items)), f, ensure_ascii=False, indent=2)
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(items, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
 
 
+def load_seen():
+    return set(load_json_list(SEEN_FILE))
+
+
+def save_seen(items):
+    save_json_list(SEEN_FILE, sorted(list(items)))
+
+
+def load_subscribers():
+    raw = load_json_list(SUBSCRIBERS_FILE)
+    return set(str(x) for x in raw)
+
+
+def save_subscribers(items):
+    save_json_list(SUBSCRIBERS_FILE, sorted(list(items)))
+
+
 SEEN = load_seen()
+SUBSCRIBERS = load_subscribers()
 
 
-def send_message(text: str):
-    if not TOKEN or not CHAT_ID:
+def send_message(chat_id: str, text: str):
+    if not TOKEN or not chat_id:
         return
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     try:
         requests.post(
             url,
-            data={"chat_id": CHAT_ID, "text": text},
+            data={"chat_id": chat_id, "text": text},
             timeout=20,
         )
     except Exception:
         pass
+
+
+def broadcast(text: str):
+    for chat_id in list(SUBSCRIBERS):
+        send_message(chat_id, text)
 
 
 def fetch_html(url: str) -> str:
@@ -150,7 +173,7 @@ def scan_site(site: dict):
     return results
 
 
-def check_tickets(manual: bool = False):
+def check_tickets(manual_chat_id: str | None = None):
     global SEEN
 
     all_hits = []
@@ -171,31 +194,42 @@ def check_tickets(manual: bool = False):
     save_seen(SEEN)
 
     if new_hits:
-        send_message("🎟 Нашла новые совпадения по Tomorrowland:")
-        for hit in new_hits:
-            send_message(
-                f"✅ {hit['target']}\n"
-                f"Платформа: {hit['site']}\n"
-                f"{hit['url']}"
-            )
+        if manual_chat_id:
+            send_message(manual_chat_id, "🎟 Нашла новые совпадения по Tomorrowland:")
+            for hit in new_hits:
+                send_message(
+                    manual_chat_id,
+                    f"✅ {hit['target']}\n"
+                    f"Платформа: {hit['site']}\n"
+                    f"{hit['url']}",
+                )
+        else:
+            broadcast("🎟 Нашла новые совпадения по Tomorrowland:")
+            for hit in new_hits:
+                broadcast(
+                    f"✅ {hit['target']}\n"
+                    f"Платформа: {hit['site']}\n"
+                    f"{hit['url']}"
+                )
         return
 
-    if manual:
+    if manual_chat_id:
         if live_hits:
             summary = "\n".join(
                 f"• {hit['target']} — {hit['site']}" for hit in live_hits[:10]
             )
             send_message(
+                manual_chat_id,
                 "Проверила вручную. Новых совпадений нет, но вижу уже известные:\n"
-                f"{summary}"
+                f"{summary}",
             )
         else:
-            send_message("Проверила вручную: пока ничего подходящего не вижу.")
+            send_message(manual_chat_id, "Проверила вручную: пока ничего подходящего не вижу.")
     else:
         if live_hits:
-            send_message("Плановая проверка: ничего нового, но старые совпадения всё ещё есть.")
+            broadcast("Плановая проверка: ничего нового, но старые совпадения всё ещё есть.")
         else:
-            send_message("Плановая проверка: пока ничего подходящего не найдено.")
+            broadcast("Плановая проверка: пока ничего подходящего не найдено.")
 
 
 def scheduler():
@@ -203,8 +237,8 @@ def scheduler():
     while True:
         now = datetime.now().strftime("%H:%M")
         if now in CHECK_TIMES and last_run != now:
-            send_message("⏰ Запускаю плановую проверку Tomorrowland...")
-            check_tickets(manual=False)
+            broadcast("⏰ Запускаю плановую проверку Tomorrowland...")
+            check_tickets(manual_chat_id=None)
             last_run = now
         time.sleep(20)
 
@@ -227,27 +261,53 @@ def set_webhook():
 
 @app.route(f"/webhook/{TOKEN}", methods=["POST"])
 def telegram_webhook():
+    global SUBSCRIBERS, SEEN
+
     data = request.get_json(silent=True) or {}
     message = data.get("message", {})
     text = (message.get("text") or "").strip()
+    chat_id = str(message.get("chat", {}).get("id", "")).strip()
+
+    if not chat_id:
+        return "ok", 200
 
     if text == "/start":
+        SUBSCRIBERS.add(chat_id)
+        save_subscribers(SUBSCRIBERS)
         send_message(
+            chat_id,
             "Бот работает.\n"
+            "Ты подписан(а) на уведомления.\n"
             "Я проверяю Tomorrowland в 10:00, 15:00 и 20:00.\n"
             "Команда /check — проверить прямо сейчас.\n"
-            "Команда /clear — очистить список уже найденного."
+            "Команда /stop — отписаться.\n"
+            "Команда /clear — очистить память найденных совпадений.",
         )
 
+    elif text == "/stop":
+        if chat_id in SUBSCRIBERS:
+            SUBSCRIBERS.remove(chat_id)
+            save_subscribers(SUBSCRIBERS)
+        send_message(chat_id, "Ты отписан(а) от уведомлений.")
+
     elif text == "/check":
-        send_message("Запускаю ручную проверку...")
-        check_tickets(manual=True)
+        send_message(chat_id, "Запускаю ручную проверку...")
+        check_tickets(manual_chat_id=chat_id)
 
     elif text == "/clear":
-        global SEEN
         SEEN = set()
         save_seen(SEEN)
-        send_message("Ок, очистила список уже найденных совпадений.")
+        send_message(chat_id, "Ок, очистила список уже найденных совпадений.")
+
+    else:
+        send_message(
+            chat_id,
+            "Я понимаю команды:\n"
+            "/start — подписаться\n"
+            "/stop — отписаться\n"
+            "/check — проверить сейчас\n"
+            "/clear — очистить память найденного",
+        )
 
     return "ok", 200
 
